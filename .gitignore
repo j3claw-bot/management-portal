@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .env
 users.json
+*.db
 *.egg-info/
 dist/
 build/

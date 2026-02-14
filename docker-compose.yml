@@ -8,7 +8,12 @@ services:
     volumes:
       - portal_data:/app/data
     environment:
-      - USERS_FILE=/app/data/users.json
+      - DB_PATH=/app/data/portal.db
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SMTP_FROM=${SMTP_FROM:-noreply@jan-miller.de}
 
 volumes:
   portal_data:
