@@ -80,6 +80,13 @@ class AuditLog(Base):
     detail = Column(Text, nullable=True)
 
 
+class Setting(Base):
+    __tablename__ = "settings"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(Text, nullable=False, default="")
+
+
 _engine = None
 _SessionLocal = None
 
@@ -104,6 +111,28 @@ def audit(actor: str, action: str, target: str | None = None, detail: str | None
     session = get_session()
     try:
         session.add(AuditLog(actor=actor, action=action, target=target, detail=detail))
+        session.commit()
+    finally:
+        session.close()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    session = get_session()
+    try:
+        row = session.query(Setting).get(key)
+        return row.value if row else default
+    finally:
+        session.close()
+
+
+def set_setting(key: str, value: str):
+    session = get_session()
+    try:
+        row = session.query(Setting).get(key)
+        if row:
+            row.value = value
+        else:
+            session.add(Setting(key=key, value=value))
         session.commit()
     finally:
         session.close()

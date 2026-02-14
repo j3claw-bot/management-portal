@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from auth import authenticate, generate_password, hash_password, init_admin
-from database import AuditLog, LocalMail, LoginEvent, User, audit, get_session
-from email_service import send_welcome_email
+from database import AuditLog, LocalMail, LoginEvent, User, audit, get_session, get_setting, set_setting
+from email_service import send_test_email, send_welcome_email
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
@@ -148,7 +148,7 @@ def show_portal():
         if user["role"] == "admin":
             page = st.radio(
                 "Navigation",
-                ["Dashboard", "User Management", "Mailbox", "Audit Log"],
+                ["Dashboard", "User Management", "Mailbox", "Email Settings", "Audit Log"],
                 horizontal=True,
                 label_visibility="collapsed",
             )
@@ -179,6 +179,8 @@ def show_portal():
         show_user_management(user)
     elif page == "Mailbox":
         show_mailbox()
+    elif page == "Email Settings":
+        show_email_settings(user)
     elif page == "Audit Log":
         show_audit_log()
 
@@ -506,6 +508,84 @@ def show_mailbox():
                 st.text(m.body_text)
     finally:
         session.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  EMAIL SETTINGS  (admin only)
+# ══════════════════════════════════════════════════════════════════════
+def show_email_settings(user: dict):
+    st.markdown('<div class="section-hdr">Mailgun Configuration</div>', unsafe_allow_html=True)
+
+    # Current values
+    current_key = get_setting("mailgun_api_key")
+    current_domain = get_setting("mailgun_domain")
+    current_from = get_setting("mailgun_from", "J3Claw Portal <noreply@jan-miller.de>")
+
+    # Status indicator
+    if current_key and current_domain:
+        st.markdown(
+            '<span style="background:#065F46;color:#6EE7B7;padding:4px 12px;'
+            'border-radius:4px;font-size:0.85rem;font-weight:600;">Configured</span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<span style="background:#78350F;color:#FCD34D;padding:4px 12px;'
+            'border-radius:4px;font-size:0.85rem;font-weight:600;">Not Configured</span>',
+            unsafe_allow_html=True,
+        )
+
+    st.caption(
+        "Mailgun is used to send emails (welcome messages, notifications). "
+        "Emails are always stored in the local mailbox regardless of send status."
+    )
+
+    with st.form("mailgun_settings"):
+        mg_key = st.text_input(
+            "API Key",
+            value=current_key,
+            type="password",
+            help="Your Mailgun API key (starts with a hex string)",
+        )
+        mg_domain = st.text_input(
+            "Domain",
+            value=current_domain,
+            help="e.g. sandbox433c19c564e6454198ed913dd9375da2.mailgun.org",
+        )
+        mg_from = st.text_input(
+            "From Address",
+            value=current_from,
+            help='e.g. J3Claw Portal <postmaster@yourdomain.mailgun.org>',
+        )
+
+        if st.form_submit_button("Save Settings", use_container_width=True):
+            set_setting("mailgun_api_key", mg_key.strip())
+            set_setting("mailgun_domain", mg_domain.strip())
+            set_setting("mailgun_from", mg_from.strip())
+            audit(user["username"], "mailgun_configured", detail=f"Domain: {mg_domain.strip()}")
+            st.success("Mailgun settings saved.")
+            st.rerun()
+
+    # Test email
+    st.markdown('<div class="section-hdr">Send Test Email</div>', unsafe_allow_html=True)
+
+    if not current_key or not current_domain:
+        st.info("Save your Mailgun settings above first.")
+    else:
+        with st.form("test_email"):
+            test_to = st.text_input("Recipient", value=user.get("email", ""))
+            if st.form_submit_button("Send Test Email", use_container_width=True):
+                if not test_to:
+                    st.error("Please enter a recipient email address.")
+                else:
+                    with st.spinner("Sending..."):
+                        success, message = send_test_email(test_to.strip())
+                    if success:
+                        st.success(f"Test email sent to {test_to}.")
+                        audit(user["username"], "test_email_sent", target=test_to)
+                    else:
+                        st.error(f"Failed: {message}")
+                        audit(user["username"], "test_email_failed", target=test_to, detail=message)
 
 
 # ══════════════════════════════════════════════════════════════════════
