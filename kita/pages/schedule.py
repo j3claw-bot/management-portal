@@ -3,6 +3,7 @@ from datetime import date, timedelta
 import streamlit as st
 
 from models import (
+    Absence,
     ChildAttendance,
     Employee,
     Group,
@@ -51,6 +52,23 @@ def _required_staff(session, group: Group, weekday: int) -> int:
         return 0
     import math
     return math.ceil(children * group.ratio_num / group.ratio_den)
+
+
+def _absent_employee_ids(session, week_monday: date) -> dict[int, set[int]]:
+    """Return {weekday: set(employee_ids)} who are absent each day of the given week."""
+    week_friday = week_monday + timedelta(days=4)
+    absences = (
+        session.query(Absence)
+        .filter(Absence.start_date <= week_friday, Absence.end_date >= week_monday)
+        .all()
+    )
+    result = {d: set() for d in range(5)}
+    for a in absences:
+        for day_offset in range(5):
+            day_date = week_monday + timedelta(days=day_offset)
+            if a.start_date <= day_date <= a.end_date:
+                result[day_offset].add(a.employee_id)
+    return result
 
 
 def _coverage_info(session, schedule_id: int, group: Group, weekday: int):
@@ -227,9 +245,46 @@ def show_schedule(user: dict, editable: bool = True):
             unsafe_allow_html=True,
         )
 
+        # --- Absences for this week ---
+        absent_by_day = _absent_employee_ids(session, view_monday)
+        # Collect all absent employee IDs across the week
+        all_absent_this_week = set()
+        for ids in absent_by_day.values():
+            all_absent_this_week |= ids
+
         # --- Grid ---
         grid_html = _build_grid_html(session, schedule, kita, groups)
         st.markdown(grid_html, unsafe_allow_html=True)
+
+        # Show absent employees
+        if all_absent_this_week:
+            absent_emps = session.query(Employee).filter(Employee.id.in_(all_absent_this_week)).all()
+            absent_names = []
+            for emp in absent_emps:
+                # Find which days they're absent
+                days = [WEEKDAYS_DE[d][:2] for d in range(5) if emp.id in absent_by_day[d]]
+                # Get absence type
+                abs_record = (
+                    session.query(Absence)
+                    .filter(
+                        Absence.employee_id == emp.id,
+                        Absence.start_date <= view_friday,
+                        Absence.end_date >= view_monday,
+                    )
+                    .first()
+                )
+                abs_type = {"urlaub": "Urlaub", "krank": "Krank", "fortbildung": "Fortb.", "sonstig": "Sonst."}.get(
+                    abs_record.absence_type, "?"
+                ) if abs_record else "?"
+                absent_names.append(f"{emp.full_name} ({abs_type}, {', '.join(days)})")
+
+            st.markdown(
+                '<div style="background:#78350F;border-radius:6px;padding:8px 12px;margin:8px 0;'
+                'color:#FCD34D;font-size:0.85rem;">'
+                f'<strong>Abwesend diese Woche:</strong> {" | ".join(absent_names)}'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
         # --- Shift list (visible to all) ---
         shifts = (
@@ -243,6 +298,11 @@ def show_schedule(user: dict, editable: bool = True):
             Employee.last_name
         ).all()
         emp_options = {e.id: e.full_name for e in employees}
+        # Available employees (not absent all week) for new shift dropdown
+        available_emp_options = {
+            e.id: e.full_name for e in employees
+            if e.id not in all_absent_this_week
+        }
         grp_options = {g.id: g.name for g in groups}
 
         if shifts:
@@ -348,8 +408,8 @@ def show_schedule(user: dict, editable: bool = True):
                         key="new_shift_day",
                     )
                     new_emp = st.selectbox(
-                        "Mitarbeiter", list(emp_options.keys()),
-                        format_func=lambda k: emp_options[k],
+                        "Mitarbeiter", list(available_emp_options.keys()),
+                        format_func=lambda k: available_emp_options[k],
                         key="new_shift_emp",
                     )
                 with c2:
@@ -368,8 +428,8 @@ def show_schedule(user: dict, editable: bool = True):
                     )
 
                 if st.form_submit_button("Schicht anlegen", use_container_width=True):
-                    if not emp_options:
-                        st.error("Keine aktiven Mitarbeiter vorhanden.")
+                    if not available_emp_options:
+                        st.error("Keine verfügbaren Mitarbeiter (alle abwesend oder inaktiv).")
                     else:
                         s_min = _time_to_min(new_start.strip())
                         e_min = _time_to_min(new_end.strip())

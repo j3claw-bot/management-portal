@@ -62,6 +62,7 @@ class Employee(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
     restrictions = relationship("EmployeeRestriction", back_populates="employee", cascade="all, delete-orphan")
+    absences = relationship("Absence", back_populates="employee", cascade="all, delete-orphan")
     shifts = relationship("Shift", back_populates="employee")
 
     @property
@@ -78,6 +79,20 @@ class EmployeeRestriction(Base):
     value = Column(String(100), nullable=False)
 
     employee = relationship("Employee", back_populates="restrictions")
+
+
+class Absence(Base):
+    __tablename__ = "absences"
+
+    id = Column(Integer, primary_key=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    absence_type = Column(String(20), nullable=False)  # "urlaub", "krank", "fortbildung", "sonstig"
+    note = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    employee = relationship("Employee", back_populates="absences")
 
 
 class ChildAttendance(Base):

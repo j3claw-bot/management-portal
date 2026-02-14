@@ -1,6 +1,8 @@
+from datetime import date
+
 import streamlit as st
 
-from models import Employee, EmployeeRestriction, Shift, Schedule, get_session
+from models import Absence, Employee, EmployeeRestriction, Shift, Schedule, get_session
 
 ROLES = {"erstkraft": "Erstkraft", "zweitkraft": "Zweitkraft"}
 AREAS = {"krippe": "Krippe", "elementar": "Elementar", "both": "Krippe & Elementar"}
@@ -12,6 +14,13 @@ RESTRICTION_TYPES = {
     "max_consecutive_days": "Max. aufeinanderfolgende Tage",
     "only_area": "Nur bestimmter Bereich",
     "fixed_schedule": "Fester Dienstplan",
+}
+
+ABSENCE_TYPES = {
+    "urlaub": "Urlaub",
+    "krank": "Krank",
+    "fortbildung": "Fortbildung",
+    "sonstig": "Sonstig",
 }
 
 WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]
@@ -47,12 +56,23 @@ def show_employees(user: dict):
         employees = query.order_by(Employee.last_name, Employee.first_name).all()
 
         if employees:
-            # Build table data
+            # Check current absences for badge
+            today = date.today()
+            absent_ids = set()
+            current_absences = (
+                session.query(Absence)
+                .filter(Absence.start_date <= today, Absence.end_date >= today)
+                .all()
+            )
+            for a in current_absences:
+                absent_ids.add(a.employee_id)
+
             rows = []
             for emp in employees:
                 scheduled = _calc_weekly_hours(session, emp.id)
                 restrictions = [RESTRICTION_TYPES.get(r.restriction_type, r.restriction_type)
                                 for r in emp.restrictions]
+                status = "Abwesend" if emp.id in absent_ids else ("Aktiv" if emp.is_active else "Archiviert")
                 rows.append({
                     "ID": emp.id,
                     "Name": emp.full_name,
@@ -62,7 +82,7 @@ def show_employees(user: dict):
                     "Tage/Wo": emp.days_per_week,
                     "Geplant (h)": round(scheduled, 1),
                     "Einschränkungen": ", ".join(restrictions) if restrictions else "—",
-                    "Aktiv": "Ja" if emp.is_active else "Nein",
+                    "Status": status,
                 })
 
             st.dataframe(rows, use_container_width=True, hide_index=True)
@@ -77,7 +97,8 @@ def show_employees(user: dict):
                 pct = min(scheduled / emp.contract_hours, 1.0) if emp.contract_hours > 0 else 0
                 col_name, col_bar = st.columns([2, 5])
                 with col_name:
-                    st.text(f"{emp.full_name}")
+                    absent_tag = " (abwesend)" if emp.id in absent_ids else ""
+                    st.text(f"{emp.full_name}{absent_tag}")
                 with col_bar:
                     st.progress(pct, text=f"{scheduled:.1f} / {emp.contract_hours:.1f} h")
         else:
@@ -166,6 +187,73 @@ def show_employees(user: dict):
                         session.commit()
                         st.success(f"{emp.full_name} wurde aktualisiert.")
                         st.rerun()
+
+                # --- Absences for selected employee ---
+                st.markdown(f'<div class="section-hdr">Abwesenheiten — {emp.full_name}</div>',
+                            unsafe_allow_html=True)
+
+                absences = (
+                    session.query(Absence)
+                    .filter_by(employee_id=emp.id)
+                    .order_by(Absence.start_date.desc())
+                    .all()
+                )
+
+                if absences:
+                    abs_rows = []
+                    for a in absences:
+                        is_current = a.start_date <= today <= a.end_date
+                        abs_rows.append({
+                            "Typ": ABSENCE_TYPES.get(a.absence_type, a.absence_type),
+                            "Von": a.start_date.strftime("%d.%m.%Y"),
+                            "Bis": a.end_date.strftime("%d.%m.%Y"),
+                            "Notiz": a.note or "—",
+                            "Status": "Aktiv" if is_current else ("Vergangen" if a.end_date < today else "Geplant"),
+                        })
+                    st.dataframe(abs_rows, use_container_width=True, hide_index=True)
+
+                    # Delete buttons
+                    for a in absences:
+                        label = (
+                            f"{ABSENCE_TYPES.get(a.absence_type, a.absence_type)} "
+                            f"{a.start_date.strftime('%d.%m.')}–{a.end_date.strftime('%d.%m.%Y')}"
+                        )
+                        if st.button(f"Löschen: {label}", key=f"del_abs_{a.id}"):
+                            session.delete(a)
+                            session.commit()
+                            st.rerun()
+                else:
+                    st.caption("Keine Abwesenheiten eingetragen.")
+
+                with st.form("add_absence", clear_on_submit=True):
+                    ac1, ac2 = st.columns(2)
+                    with ac1:
+                        abs_type = st.selectbox(
+                            "Typ", list(ABSENCE_TYPES.keys()),
+                            format_func=lambda k: ABSENCE_TYPES[k],
+                        )
+                        abs_start = st.date_input("Von", value=today)
+                    with ac2:
+                        abs_note = st.text_input("Notiz (optional)")
+                        abs_end = st.date_input("Bis", value=today)
+
+                    if st.form_submit_button("Abwesenheit eintragen", use_container_width=True):
+                        if abs_end < abs_start:
+                            st.error("Das Enddatum muss nach dem Startdatum liegen.")
+                        else:
+                            session.add(Absence(
+                                employee_id=emp.id,
+                                start_date=abs_start,
+                                end_date=abs_end,
+                                absence_type=abs_type,
+                                note=abs_note.strip() or None,
+                            ))
+                            session.commit()
+                            st.success(
+                                f"Abwesenheit eingetragen: {ABSENCE_TYPES[abs_type]} "
+                                f"{abs_start.strftime('%d.%m.')}–{abs_end.strftime('%d.%m.%Y')}"
+                            )
+                            st.rerun()
 
                 # --- Restrictions for selected employee ---
                 st.markdown(f'<div class="section-hdr">Einschränkungen — {emp.full_name}</div>',
