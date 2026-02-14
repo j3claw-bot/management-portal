@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
     create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
@@ -53,6 +54,32 @@ class LoginEvent(Base):
     user = relationship("User", back_populates="login_history")
 
 
+class LocalMail(Base):
+    __tablename__ = "local_mail"
+
+    id = Column(Integer, primary_key=True)
+    to_email = Column(String(255), nullable=False, index=True)
+    subject = Column(String(500), nullable=False)
+    body_text = Column(Text, nullable=False)
+    sent_via_smtp = Column(Boolean, default=False, nullable=False)
+    created_at = Column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+    )
+    actor = Column(String(80), nullable=False)
+    action = Column(String(50), nullable=False, index=True)
+    target = Column(String(120), nullable=True)
+    detail = Column(Text, nullable=True)
+
+
 _engine = None
 _SessionLocal = None
 
@@ -71,3 +98,12 @@ def get_session() -> Session:
     if _SessionLocal is None:
         _SessionLocal = sessionmaker(bind=get_engine())
     return _SessionLocal()
+
+
+def audit(actor: str, action: str, target: str | None = None, detail: str | None = None):
+    session = get_session()
+    try:
+        session.add(AuditLog(actor=actor, action=action, target=target, detail=detail))
+        session.commit()
+    finally:
+        session.close()

@@ -5,8 +5,7 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from auth import authenticate, generate_password, hash_password, init_admin
-from database import LoginEvent, User, get_session
-from email_service import is_configured as smtp_configured
+from database import AuditLog, LocalMail, LoginEvent, User, audit, get_session
 from email_service import send_welcome_email
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -21,7 +20,8 @@ st.set_page_config(
 # ── Initialise admin on first run ──────────────────────────────────────
 admin_pw = init_admin()
 if admin_pw:
-    logging.info("Initial admin password: %s", admin_pw)
+    # Store it so the very first page load shows it
+    st.session_state.setdefault("_init_admin_pw", admin_pw)
 
 # ── CSS ────────────────────────────────────────────────────────────────
 st.markdown(
@@ -43,6 +43,14 @@ st.markdown(
 .stat-lbl{color:#94A3B8;font-size:.8rem;margin-top:.25rem}
 .section-hdr{font-size:1.15rem;font-weight:600;color:#F1F5F9;margin:1.5rem 0 .75rem;
   padding-bottom:.5rem;border-bottom:1px solid #334155}
+.pw-box{background:#1a1a2e;border:1px solid #4F46E5;border-radius:8px;padding:1rem 1.25rem;
+  margin:.75rem 0;font-family:monospace;font-size:1.1rem;color:#A5B4FC;letter-spacing:.5px}
+.mail-card{background:#1E293B;border:1px solid #334155;border-radius:8px;padding:1rem;margin:.5rem 0}
+.mail-to{color:#A5B4FC;font-size:.85rem;font-weight:600}
+.mail-subj{color:#E2E8F0;font-size:.95rem;margin:.25rem 0}
+.mail-time{color:#64748B;font-size:.75rem}
+.mail-badge-smtp{background:#065F46;color:#6EE7B7;font-size:.7rem;padding:.15rem .5rem;border-radius:999px}
+.mail-badge-local{background:#78350F;color:#FCD34D;font-size:.7rem;padding:.15rem .5rem;border-radius:999px}
 </style>
 """,
     unsafe_allow_html=True,
@@ -69,10 +77,26 @@ def _ago(dt: datetime | None) -> str:
     return f"{d}d ago"
 
 
+def _ts(dt: datetime | None) -> str:
+    if dt is None:
+        return "—"
+    dt_utc = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    return dt_utc.strftime("%Y-%m-%d %H:%M UTC")
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  LOGIN
 # ══════════════════════════════════════════════════════════════════════
 def show_login():
+    # Show initial admin password on very first run
+    if "_init_admin_pw" in st.session_state:
+        st.warning(
+            f"**First run — initial admin credentials:**  \n"
+            f"Username: `admin`  \n"
+            f"Password: `{st.session_state['_init_admin_pw']}`  \n"
+            f"Change this immediately after logging in."
+        )
+
     st.markdown(
         '<div class="login-wrap"><div class="brand">'
         '<div class="icon">🦀</div>'
@@ -95,8 +119,11 @@ def show_login():
                     if result:
                         st.session_state["auth"] = True
                         st.session_state["user"] = result
+                        st.session_state.pop("_init_admin_pw", None)
+                        audit(user, "login", detail="Successful login")
                         st.rerun()
                     else:
+                        audit(user, "login_failed", detail="Invalid credentials")
                         st.error("Invalid credentials.")
 
 
@@ -121,7 +148,7 @@ def show_portal():
         if user["role"] == "admin":
             page = st.radio(
                 "Navigation",
-                ["Dashboard", "User Management"],
+                ["Dashboard", "User Management", "Mailbox", "Audit Log"],
                 horizontal=True,
                 label_visibility="collapsed",
             )
@@ -129,13 +156,18 @@ def show_portal():
             page = "Dashboard"
     with col_out:
         if st.button("Sign Out"):
+            audit(user["username"], "logout")
             st.session_state.clear()
             st.rerun()
 
     if page == "Dashboard":
         show_dashboard(user)
     elif page == "User Management":
-        show_user_management()
+        show_user_management(user)
+    elif page == "Mailbox":
+        show_mailbox()
+    elif page == "Audit Log":
+        show_audit_log()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -147,12 +179,8 @@ def show_dashboard(user: dict):
         db_user = session.query(User).get(user["id"])
         total_users = session.query(User).filter_by(is_active=True).count()
         total_logins = session.query(LoginEvent).count()
-        recent_events = (
-            session.query(LoginEvent)
-            .order_by(LoginEvent.logged_in_at.desc())
-            .limit(10)
-            .all()
-        )
+        total_mails = session.query(LocalMail).count()
+        total_audit = session.query(AuditLog).count()
 
         st.markdown('<div class="section-hdr">Overview</div>', unsafe_allow_html=True)
 
@@ -182,19 +210,59 @@ def show_dashboard(user: dict):
                 unsafe_allow_html=True,
             )
 
+        if user["role"] == "admin":
+            st.markdown("")
+            c5, c6, c7, c8 = st.columns(4)
+            with c5:
+                st.markdown(
+                    f'<div class="stat-card"><div class="stat-val">{total_mails}</div>'
+                    f'<div class="stat-lbl">Emails Sent</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c6:
+                st.markdown(
+                    f'<div class="stat-card"><div class="stat-val">{total_audit}</div>'
+                    f'<div class="stat-lbl">Audit Events</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c7:
+                inactive = session.query(User).filter_by(is_active=False).count()
+                st.markdown(
+                    f'<div class="stat-card"><div class="stat-val">{inactive}</div>'
+                    f'<div class="stat-lbl">Inactive Users</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c8:
+                never_logged = (
+                    session.query(User)
+                    .filter_by(is_active=True)
+                    .filter(User.last_login.is_(None))
+                    .count()
+                )
+                st.markdown(
+                    f'<div class="stat-card"><div class="stat-val">{never_logged}</div>'
+                    f'<div class="stat-lbl">Never Logged In</div></div>',
+                    unsafe_allow_html=True,
+                )
+
         st.markdown(
             '<div class="section-hdr">Recent Activity</div>', unsafe_allow_html=True
+        )
+        recent_events = (
+            session.query(LoginEvent)
+            .order_by(LoginEvent.logged_in_at.desc())
+            .limit(10)
+            .all()
         )
         if recent_events:
             rows = []
             for ev in recent_events:
                 ev_user = session.query(User).get(ev.user_id)
-                ts = ev.logged_in_at.replace(tzinfo=timezone.utc) if ev.logged_in_at.tzinfo is None else ev.logged_in_at
                 rows.append(
                     {
                         "User": ev_user.username if ev_user else "?",
                         "Name": ev_user.name if ev_user else "?",
-                        "Time": ts.strftime("%Y-%m-%d %H:%M UTC"),
+                        "Time": _ts(ev.logged_in_at),
                         "IP": ev.ip_address or "—",
                     }
                 )
@@ -202,7 +270,7 @@ def show_dashboard(user: dict):
         else:
             st.info("No login events yet.")
 
-        # ── Your profile summary ──
+        # ── Your profile ──
         if db_user:
             st.markdown(
                 '<div class="section-hdr">Your Profile</div>', unsafe_allow_html=True
@@ -214,10 +282,9 @@ def show_dashboard(user: dict):
             with pc2:
                 st.text_input("Email", db_user.email, disabled=True)
                 st.text_input("Role", db_user.role, disabled=True)
-                created = db_user.created_at.replace(tzinfo=timezone.utc) if db_user.created_at.tzinfo is None else db_user.created_at
                 st.text_input(
                     "Member since",
-                    created.strftime("%Y-%m-%d"),
+                    _ts(db_user.created_at).split(" ")[0] if db_user.created_at else "—",
                     disabled=True,
                 )
     finally:
@@ -227,23 +294,15 @@ def show_dashboard(user: dict):
 # ══════════════════════════════════════════════════════════════════════
 #  USER MANAGEMENT  (admin only)
 # ══════════════════════════════════════════════════════════════════════
-def show_user_management():
+def show_user_management(current_user: dict):
     session = get_session()
     try:
         users = session.query(User).order_by(User.id).all()
 
-        st.markdown(
-            '<div class="section-hdr">Users</div>', unsafe_allow_html=True
-        )
+        st.markdown('<div class="section-hdr">Users</div>', unsafe_allow_html=True)
 
         rows = []
         for u in users:
-            last = u.last_login
-            if last:
-                last = last.replace(tzinfo=timezone.utc) if last.tzinfo is None else last
-                last_str = last.strftime("%Y-%m-%d %H:%M UTC")
-            else:
-                last_str = "Never"
             rows.append(
                 {
                     "ID": u.id,
@@ -253,10 +312,30 @@ def show_user_management():
                     "Role": u.role,
                     "Active": "Yes" if u.is_active else "No",
                     "Logins": u.login_count,
-                    "Last Login": last_str,
+                    "Last Login": _ts(u.last_login) if u.last_login else "Never",
                 }
             )
         st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        # ── Show pending generated password ──
+        if "created_user_info" in st.session_state:
+            info = st.session_state["created_user_info"]
+            st.success(f"User **{info['username']}** created successfully.")
+            if info.get("generated_pw"):
+                st.markdown(
+                    f"**Generated password — copy it now, it won't be shown again:**"
+                )
+                st.markdown(
+                    f'<div class="pw-box">{info["generated_pw"]}</div>',
+                    unsafe_allow_html=True,
+                )
+            if info.get("email_smtp"):
+                st.info("Welcome email sent via SMTP.")
+            else:
+                st.info("Welcome email saved to local mailbox (SMTP not configured).")
+            if st.button("Dismiss", key="dismiss_pw"):
+                del st.session_state["created_user_info"]
+                st.rerun()
 
         # ── Create user ──
         st.markdown(
@@ -295,17 +374,19 @@ def show_user_management():
                     session.commit()
 
                     email_sent = send_welcome_email(new_email, new_name, new_username)
-                    email_msg = " Welcome email sent." if email_sent else ""
+                    audit(
+                        current_user["username"],
+                        "user_created",
+                        target=new_username,
+                        detail=f"Role: {new_role}, Email: {new_email}",
+                    )
 
-                    if not new_password:
-                        st.success(
-                            f"User **{new_username}** created. "
-                            f"Generated password: `{pw}`{email_msg}"
-                        )
-                    else:
-                        st.success(
-                            f"User **{new_username}** created.{email_msg}"
-                        )
+                    # Persist the result in session state so it survives rerun
+                    st.session_state["created_user_info"] = {
+                        "username": new_username,
+                        "generated_pw": pw if not new_password else None,
+                        "email_smtp": email_sent,
+                    }
                     st.rerun()
 
         # ── Edit / deactivate ──
@@ -335,6 +416,18 @@ def show_user_management():
                     save = st.form_submit_button("Save Changes")
 
                     if save:
+                        changes = []
+                        if sel_user.name != edit_name:
+                            changes.append(f"name: {sel_user.name} -> {edit_name}")
+                        if sel_user.email != edit_email:
+                            changes.append(f"email: {sel_user.email} -> {edit_email}")
+                        if sel_user.role != edit_role:
+                            changes.append(f"role: {sel_user.role} -> {edit_role}")
+                        if sel_user.is_active != edit_active:
+                            changes.append(f"active: {sel_user.is_active} -> {edit_active}")
+                        if reset_pw:
+                            changes.append("password reset")
+
                         sel_user.name = edit_name
                         sel_user.email = edit_email
                         sel_user.role = edit_role
@@ -342,8 +435,141 @@ def show_user_management():
                         if reset_pw:
                             sel_user.password_hash = hash_password(reset_pw)
                         session.commit()
+
+                        audit(
+                            current_user["username"],
+                            "user_edited",
+                            target=sel,
+                            detail="; ".join(changes) if changes else "no changes",
+                        )
                         st.success(f"User **{sel}** updated.")
                         st.rerun()
+    finally:
+        session.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MAILBOX  (admin only)
+# ══════════════════════════════════════════════════════════════════════
+def show_mailbox():
+    session = get_session()
+    try:
+        mails = (
+            session.query(LocalMail)
+            .order_by(LocalMail.created_at.desc())
+            .limit(50)
+            .all()
+        )
+
+        smtp_count = sum(1 for m in mails if m.sent_via_smtp)
+        local_count = len(mails) - smtp_count
+
+        st.markdown('<div class="section-hdr">Local Mailbox</div>', unsafe_allow_html=True)
+        st.caption(
+            f"All outgoing emails are stored here. "
+            f"{smtp_count} sent via SMTP, {local_count} local only."
+        )
+
+        if not mails:
+            st.info("No emails yet.")
+            return
+
+        for m in mails:
+            badge = (
+                '<span class="mail-badge-smtp">SMTP</span>'
+                if m.sent_via_smtp
+                else '<span class="mail-badge-local">Local Only</span>'
+            )
+            st.markdown(
+                f'<div class="mail-card">'
+                f'<div class="mail-to">To: {m.to_email} {badge}</div>'
+                f'<div class="mail-subj">{m.subject}</div>'
+                f'<div class="mail-time">{_ts(m.created_at)}</div>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            with st.expander("View content"):
+                st.text(m.body_text)
+    finally:
+        session.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  AUDIT LOG  (admin only)
+# ══════════════════════════════════════════════════════════════════════
+def show_audit_log():
+    session = get_session()
+    try:
+        st.markdown('<div class="section-hdr">Audit Log</div>', unsafe_allow_html=True)
+
+        # Filters
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            actions = [r[0] for r in session.query(AuditLog.action).distinct().all()]
+            sel_action = st.selectbox("Filter by action", ["All"] + sorted(actions))
+        with fc2:
+            actors = [r[0] for r in session.query(AuditLog.actor).distinct().all()]
+            sel_actor = st.selectbox("Filter by user", ["All"] + sorted(actors))
+        with fc3:
+            limit = st.selectbox("Show last", [50, 100, 250, 500], index=0)
+
+        q = session.query(AuditLog)
+        if sel_action != "All":
+            q = q.filter(AuditLog.action == sel_action)
+        if sel_actor != "All":
+            q = q.filter(AuditLog.actor == sel_actor)
+        logs = q.order_by(AuditLog.timestamp.desc()).limit(limit).all()
+
+        # Stats row
+        total = session.query(AuditLog).count()
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_count = (
+            session.query(AuditLog)
+            .filter(AuditLog.timestamp >= today_start)
+            .count()
+        )
+        failed_logins = (
+            session.query(AuditLog)
+            .filter(AuditLog.action == "login_failed")
+            .count()
+        )
+
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            st.markdown(
+                f'<div class="stat-card"><div class="stat-val">{total}</div>'
+                f'<div class="stat-lbl">Total Events</div></div>',
+                unsafe_allow_html=True,
+            )
+        with sc2:
+            st.markdown(
+                f'<div class="stat-card"><div class="stat-val">{today_count}</div>'
+                f'<div class="stat-lbl">Events Today</div></div>',
+                unsafe_allow_html=True,
+            )
+        with sc3:
+            st.markdown(
+                f'<div class="stat-card"><div class="stat-val">{failed_logins}</div>'
+                f'<div class="stat-lbl">Failed Logins (all time)</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("")
+        if logs:
+            rows = []
+            for entry in logs:
+                rows.append(
+                    {
+                        "Time": _ts(entry.timestamp),
+                        "User": entry.actor,
+                        "Action": entry.action,
+                        "Target": entry.target or "—",
+                        "Detail": entry.detail or "—",
+                    }
+                )
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No audit events match your filters.")
     finally:
         session.close()
 
