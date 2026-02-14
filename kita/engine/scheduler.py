@@ -26,6 +26,7 @@ from engine.constraints import (
     is_available,
     can_work_in_group,
     shift_duration_hours,
+    validate_schedule,
 )
 
 
@@ -81,10 +82,45 @@ def _pick_shift_template(employee: Employee, restrictions: list[EmployeeRestrict
     return MID_SHIFT
 
 
+def _get_max_consecutive(restrictions: list[EmployeeRestriction]) -> int | None:
+    """Extract max_consecutive_days restriction value, or None if not set."""
+    for r in restrictions:
+        if r.restriction_type == "max_consecutive_days":
+            try:
+                return int(r.value)
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _would_exceed_consecutive(emp_id: int, weekday: int,
+                               days_assigned: dict[int, list[int]],
+                               max_consecutive: int) -> bool:
+    """Check if assigning emp to weekday would exceed max consecutive days."""
+    assigned_days = set(days_assigned.get(emp_id, []))
+    assigned_days.add(weekday)
+
+    # Find the longest run of consecutive days in the assigned set
+    if not assigned_days:
+        return False
+
+    sorted_days = sorted(assigned_days)
+    max_run = 1
+    current_run = 1
+    for i in range(1, len(sorted_days)):
+        if sorted_days[i] == sorted_days[i - 1] + 1:
+            current_run += 1
+            max_run = max(max_run, current_run)
+        else:
+            current_run = 1
+
+    return max_run > max_consecutive
+
+
 def _score_employee_for_group(employee: Employee, group: Group,
                                restrictions: list[EmployeeRestriction],
                                hours_so_far: float,
-                               assigned_today: set[int],
+                               group_assigned: set[int],
                                colleague_prefs: dict[int, set[int]]) -> float:
     """Score how suitable an employee is for a group assignment. Higher = better."""
     score = 0.0
@@ -104,11 +140,11 @@ def _score_employee_for_group(employee: Employee, group: Group,
     utilization = hours_so_far / target_hours if target_hours > 0 else 1.0
     score += max(0, 5 * (1 - utilization))
 
-    # Colleague preference bonus
+    # Colleague preference bonus — check if preferred colleagues are in THIS GROUP
     if employee.id in colleague_prefs:
         preferred = colleague_prefs[employee.id]
-        overlap = preferred & assigned_today
-        score += 3 * len(overlap)
+        overlap = preferred & group_assigned
+        score += 5 * len(overlap)
 
     return score
 
@@ -120,7 +156,7 @@ def generate_schedule(session, week_monday: date) -> dict:
     Returns {
         "shifts": [(employee_id, group_id, weekday, start, end, break_start, break_min), ...],
         "warnings": [str, ...],
-        "scores": {"coverage": int, "fairness": int, "preference": int},
+        "scores": {"coverage": int, "fairness": int, "preference": int, "compliance": int},
     }
     """
     kita = session.query(KitaSettings).first()
@@ -131,9 +167,11 @@ def generate_schedule(session, week_monday: date) -> dict:
     # Load all restrictions
     emp_restrictions = {}
     colleague_prefs = {}  # emp_id -> set of preferred colleague ids
+    max_consecutive = {}  # emp_id -> max consecutive days (or None)
     for emp in employees:
         restrictions = get_restrictions(session, emp.id)
         emp_restrictions[emp.id] = restrictions
+        max_consecutive[emp.id] = _get_max_consecutive(restrictions)
         for r in restrictions:
             if r.restriction_type == "prefers_colleague":
                 try:
@@ -146,6 +184,10 @@ def generate_schedule(session, week_monday: date) -> dict:
     warnings = []
     hours_tracker = {emp.id: 0.0 for emp in employees}
     days_tracker = {emp.id: 0 for emp in employees}
+    days_assigned = {emp.id: [] for emp in employees}  # emp_id -> list of weekdays
+
+    # Track which group each employee is assigned to each day
+    group_assignments = {}  # (weekday, group_id) -> set of emp_ids
 
     for weekday in range(5):
         absent_ids = absent_by_day[weekday]
@@ -169,6 +211,9 @@ def generate_schedule(session, week_monday: date) -> dict:
         late_target = max(1, total_needed // 3)    # ~1/3 should be late
 
         for group, required in group_needs:
+            group_key = (weekday, group.id)
+            group_assignments.setdefault(group_key, set())
+
             # Get available employees for this group
             candidates = []
             for emp in employees:
@@ -185,6 +230,12 @@ def generate_schedule(session, week_monday: date) -> dict:
                 daily_target = emp.contract_hours / emp.days_per_week
                 if hours_tracker[emp.id] + daily_target > emp.contract_hours + 1:
                     continue
+                # Check max consecutive days
+                mc = max_consecutive[emp.id]
+                if mc is not None and _would_exceed_consecutive(
+                    emp.id, weekday, days_assigned, mc
+                ):
+                    continue
                 candidates.append(emp)
 
             # Score and sort candidates
@@ -192,14 +243,15 @@ def generate_schedule(session, week_monday: date) -> dict:
             for emp in candidates:
                 score = _score_employee_for_group(
                     emp, group, emp_restrictions[emp.id],
-                    hours_tracker[emp.id], assigned_today, colleague_prefs,
+                    hours_tracker[emp.id],
+                    group_assignments[group_key],
+                    colleague_prefs,
                 )
                 scored.append((score, emp))
             scored.sort(key=lambda x: x[0], reverse=True)
 
             # Ensure at least one Erstkraft
             erstkraft_candidates = [(s, e) for s, e in scored if e.role == "erstkraft"]
-            zweitkraft_candidates = [(s, e) for s, e in scored if e.role == "zweitkraft"]
 
             assigned_to_group = []
 
@@ -238,7 +290,9 @@ def generate_schedule(session, week_monday: date) -> dict:
                 hours = shift_duration_hours(start, end, break_min)
                 hours_tracker[emp.id] += hours
                 days_tracker[emp.id] += 1
+                days_assigned[emp.id].append(weekday)
                 assigned_today.add(emp.id)
+                group_assignments[group_key].add(emp.id)
 
                 shifts.append((emp.id, group.id, weekday, start, end, break_start, break_min))
 
@@ -282,15 +336,21 @@ def generate_schedule(session, week_monday: date) -> dict:
                 pref_total += 1
                 try:
                     colleague_id = int(r.value)
-                    for weekday in range(5):
-                        emp_on_day = any(s[0] == emp.id and s[2] == weekday for s in shifts)
-                        col_on_day = any(s[0] == colleague_id and s[2] == weekday for s in shifts)
-                        if emp_on_day and col_on_day:
+                    # Check if they're in the SAME GROUP on any day
+                    for wd in range(5):
+                        emp_groups = {s[1] for s in shifts if s[0] == emp.id and s[2] == wd}
+                        col_groups = {s[1] for s in shifts if s[0] == colleague_id and s[2] == wd}
+                        if emp_groups & col_groups:  # same group on same day
                             pref_satisfied += 1
                             break
                 except (ValueError, TypeError):
                     pass
     preference_score = int((pref_satisfied / pref_total * 100)) if pref_total > 0 else 100
+
+    # Compliance score: percentage of constraint checks passed
+    total_checks = max(1, total_required + len(employees))  # groups + employees
+    violation_count = len(warnings)
+    compliance_score = max(0, int((1 - violation_count / total_checks) * 100))
 
     return {
         "shifts": shifts,
@@ -299,6 +359,7 @@ def generate_schedule(session, week_monday: date) -> dict:
             "coverage": coverage_score,
             "fairness": fairness_score,
             "preference": preference_score,
+            "compliance": compliance_score,
         },
     }
 
@@ -328,6 +389,6 @@ def apply_schedule(session, schedule: Schedule, result: dict):
     schedule.score_coverage = result["scores"]["coverage"]
     schedule.score_fairness = result["scores"]["fairness"]
     schedule.score_preference = result["scores"]["preference"]
-    schedule.score_compliance = 1 if not result["warnings"] else 0
+    schedule.score_compliance = result["scores"]["compliance"]
 
     session.commit()

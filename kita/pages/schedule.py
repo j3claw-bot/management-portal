@@ -1,4 +1,5 @@
-from datetime import date, timedelta
+import re
+from datetime import date, datetime, timedelta, timezone
 
 import streamlit as st
 
@@ -14,8 +15,10 @@ from models import (
 )
 from engine.scheduler import generate_schedule, apply_schedule
 from engine.scoring import score_color, score_label
+from engine.constraints import validate_schedule, shift_duration_hours
 
 WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]
+TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
 def _monday_of(d: date) -> date:
@@ -23,7 +26,6 @@ def _monday_of(d: date) -> date:
 
 
 def _time_slots(open_time: str, close_time: str):
-    """Generate 30-minute time slot labels from open to close."""
     oh, om = map(int, open_time.split(":"))
     ch, cm = map(int, close_time.split(":"))
     start = oh * 60 + om
@@ -42,22 +44,21 @@ def _time_to_min(t: str) -> int:
     return h * 60 + m
 
 
+def _valid_time(t: str) -> bool:
+    return bool(TIME_RE.match(t.strip()))
+
+
 def _required_staff(session, group: Group, weekday: int) -> int:
-    """Calculate required staff for a group on a given weekday based on child attendance and ratio."""
     att = session.query(ChildAttendance).filter_by(
         group_id=group.id, weekday=weekday
     ).first()
-    if not att:
-        return 0
-    children = att.expected_children
-    if children <= 0:
+    if not att or att.expected_children <= 0:
         return 0
     import math
-    return math.ceil(children * group.ratio_num / group.ratio_den)
+    return math.ceil(att.expected_children * group.ratio_num / group.ratio_den)
 
 
 def _absent_employee_ids(session, week_monday: date) -> dict[int, set[int]]:
-    """Return {weekday: set(employee_ids)} who are absent each day of the given week."""
     week_friday = week_monday + timedelta(days=4)
     absences = (
         session.query(Absence)
@@ -74,7 +75,6 @@ def _absent_employee_ids(session, week_monday: date) -> dict[int, set[int]]:
 
 
 def _coverage_info(session, schedule_id: int, group: Group, weekday: int):
-    """Return (assigned_count, required_count) for a group on a weekday."""
     required = _required_staff(session, group, weekday)
     assigned = session.query(Shift).filter_by(
         schedule_id=schedule_id, group_id=group.id, weekday=weekday
@@ -83,20 +83,16 @@ def _coverage_info(session, schedule_id: int, group: Group, weekday: int):
 
 
 def _build_grid_html(session, schedule: Schedule, kita: KitaSettings, groups):
-    """Build the HTML schedule grid table."""
     slots = _time_slots(kita.open_time, kita.close_time)
     core_start = _time_to_min(kita.core_start)
     core_end = _time_to_min(kita.core_end)
 
-    # Load all shifts for this schedule, organized by (weekday, slot)
     all_shifts = session.query(Shift).filter_by(schedule_id=schedule.id).all()
 
-    # Map: (weekday) -> list of shifts
     shifts_by_day = {}
     for s in all_shifts:
         shifts_by_day.setdefault(s.weekday, []).append(s)
 
-    # Load employees and groups for display
     emp_map = {}
     for s in all_shifts:
         if s.employee_id not in emp_map:
@@ -127,32 +123,28 @@ def _build_grid_html(session, schedule: Schedule, kita: KitaSettings, groups):
                 s_start = _time_to_min(s.start_time)
                 s_end = _time_to_min(s.end_time)
 
-                # Show shift block in the starting slot
                 if s_start == slot_min:
                     emp = emp_map.get(s.employee_id)
                     grp = grp_map.get(s.group_id) if s.group_id else None
                     area_cls = "shift-krippe" if (grp and grp.area == "krippe") else "shift-elementar"
                     emp_name = emp.full_name if emp else "?"
                     grp_name = grp.name if grp else "—"
-                    span_slots = max(1, (s_end - s_start) // 30)
+                    role_badge = "[E]" if emp and emp.role == "erstkraft" else "[Z]"
+                    manual_tag = " *" if s.is_manual else ""
 
                     cell_content += (
                         f'<div class="shift-block {area_cls}" '
-                        f'title="{emp_name} | {grp_name} | {s.start_time}-{s.end_time}">'
-                        f"{emp_name[:15]}<br>"
+                        f'title="{emp_name} | {grp_name} | {s.start_time}-{s.end_time}{manual_tag}">'
+                        f"<small style='opacity:0.7'>{role_badge}</small> {emp_name[:15]}<br>"
                         f"<small>{grp_name} {s.start_time}-{s.end_time}</small>"
                         f"</div>"
                     )
 
-                # Show break indicator
                 if s.break_start:
                     b_start = _time_to_min(s.break_start)
                     if b_start == slot_min:
-                        emp = emp_map.get(s.employee_id)
-                        emp_name = emp.full_name if emp else "?"
                         cell_content += (
-                            f'<div class="shift-block shift-break" '
-                            f'title="Pause: {emp_name}">'
+                            f'<div class="shift-block shift-break">'
                             f"<small>Pause {s.break_minutes}min</small></div>"
                         )
 
@@ -179,9 +171,7 @@ def _build_grid_html(session, schedule: Schedule, kita: KitaSettings, groups):
                 f"</div></div>"
             )
         html += f'<td>{"".join(coverage_parts)}</td>'
-    html += "</tr>"
-
-    html += "</tbody></table>"
+    html += "</tr></tbody></table>"
     return html
 
 
@@ -207,13 +197,11 @@ def show_schedule(user: dict, editable: bool = True):
         c1, c2, c3 = st.columns([1, 3, 1])
         with c1:
             if st.button("< Vorherige Woche"):
-                week_offset = st.session_state.get("week_offset", 0) - 1
-                st.session_state["week_offset"] = week_offset
+                st.session_state["week_offset"] = st.session_state.get("week_offset", 0) - 1
                 st.rerun()
         with c3:
             if st.button("Nächste Woche >"):
-                week_offset = st.session_state.get("week_offset", 0) + 1
-                st.session_state["week_offset"] = week_offset
+                st.session_state["week_offset"] = st.session_state.get("week_offset", 0) + 1
                 st.rerun()
 
         week_offset = st.session_state.get("week_offset", 0)
@@ -247,9 +235,8 @@ def show_schedule(user: dict, editable: bool = True):
             unsafe_allow_html=True,
         )
 
-        # --- Absences for this week ---
+        # --- Absences ---
         absent_by_day = _absent_employee_ids(session, view_monday)
-        # Collect all absent employee IDs across the week
         all_absent_this_week = set()
         for ids in absent_by_day.values():
             all_absent_this_week |= ids
@@ -258,14 +245,12 @@ def show_schedule(user: dict, editable: bool = True):
         grid_html = _build_grid_html(session, schedule, kita, groups)
         st.markdown(grid_html, unsafe_allow_html=True)
 
-        # Show absent employees
+        # Absent employees banner
         if all_absent_this_week:
             absent_emps = session.query(Employee).filter(Employee.id.in_(all_absent_this_week)).all()
             absent_names = []
             for emp in absent_emps:
-                # Find which days they're absent
                 days = [WEEKDAYS_DE[d][:2] for d in range(5) if emp.id in absent_by_day[d]]
-                # Get absence type
                 abs_record = (
                     session.query(Absence)
                     .filter(
@@ -283,55 +268,164 @@ def show_schedule(user: dict, editable: bool = True):
             st.markdown(
                 '<div style="background:#78350F;border-radius:6px;padding:8px 12px;margin:8px 0;'
                 'color:#FCD34D;font-size:0.85rem;">'
-                f'<strong>Abwesend diese Woche:</strong> {" | ".join(absent_names)}'
+                f'<strong>Abwesend:</strong> {" | ".join(absent_names)}'
                 '</div>',
                 unsafe_allow_html=True,
             )
 
-        # --- Scores (if available) ---
-        if schedule.score_coverage > 0 or schedule.score_fairness > 0:
-            sc1, sc2, sc3 = st.columns(3)
+        # --- Score cards (4 columns) ---
+        has_scores = schedule.score_coverage > 0 or schedule.score_fairness > 0
+        if has_scores:
+            sc1, sc2, sc3, sc4 = st.columns(4)
             for col, label, val in [
                 (sc1, "Abdeckung", schedule.score_coverage),
                 (sc2, "Fairness", schedule.score_fairness),
                 (sc3, "Präferenzen", schedule.score_preference),
+                (sc4, "Compliance", schedule.score_compliance),
             ]:
                 with col:
                     color = score_color(val)
                     st.markdown(
                         f'<div style="background:#1E293B;border-radius:8px;padding:8px 12px;text-align:center;">'
-                        f'<div style="color:#94A3B8;font-size:0.75rem;text-transform:uppercase;">{label}</div>'
+                        f'<div style="color:#94A3B8;font-size:0.7rem;text-transform:uppercase;">{label}</div>'
                         f'<div style="color:{color};font-size:1.4rem;font-weight:700;">{val}%</div>'
                         f'<div style="color:#64748B;font-size:0.7rem;">{score_label(val)}</div>'
                         f'</div>',
                         unsafe_allow_html=True,
                     )
 
-        # --- Auto-generate (admin only) ---
+        # --- Constraint validation panel ---
+        shifts_exist = session.query(Shift).filter_by(schedule_id=schedule.id).count() > 0
+        if shifts_exist:
+            violations = validate_schedule(session, schedule.id, view_monday, groups, kita)
+            if violations:
+                v_html = "".join(f"<li>{v}</li>" for v in violations)
+                st.markdown(
+                    f'<div style="background:#7F1D1D;border-radius:8px;padding:0.8rem 1rem;'
+                    f'margin:0.5rem 0;color:#FCA5A5;">'
+                    f'<div style="font-weight:600;margin-bottom:4px;">&#9888; {len(violations)} Regelverletzung(en)</div>'
+                    f'<ul style="margin:0;padding-left:1.2rem;font-size:0.85rem;">{v_html}</ul>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div style="background:#14532D;border-radius:8px;padding:0.6rem 1rem;'
+                    'margin:0.5rem 0;color:#86EFAC;font-size:0.9rem;">'
+                    '&#10003; Alle Regeln eingehalten — keine Verletzungen.</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # --- Auto-generate (admin only, draft only) ---
         if editable and schedule.status == "draft":
             st.markdown('<div class="section-hdr">Automatische Planung</div>',
                         unsafe_allow_html=True)
-            ag_c1, ag_c2 = st.columns([3, 1])
-            with ag_c1:
+
+            gen_c1, gen_c2, gen_c3 = st.columns([3, 1, 1])
+            with gen_c1:
                 st.caption(
                     "Erstellt einen Dienstplan basierend auf verfügbaren Mitarbeitern, "
                     "Betreuungsschlüsseln, Abwesenheiten und Präferenzen. "
                     "Manuell erstellte Schichten bleiben erhalten."
                 )
-            with ag_c2:
-                if st.button("Dienstplan generieren", use_container_width=True, type="primary"):
+
+            # Preview mode: generate without applying
+            with gen_c2:
+                if st.button("Vorschau", use_container_width=True):
+                    with st.spinner("Berechne..."):
+                        preview = generate_schedule(session, view_monday)
+                    st.session_state["schedule_preview"] = preview
+
+            with gen_c3:
+                if st.button("Generieren & Anwenden", use_container_width=True, type="primary"):
                     with st.spinner("Plane Schichten..."):
                         result = generate_schedule(session, view_monday)
                         apply_schedule(session, schedule, result)
-
                     if result["warnings"]:
                         for w in result["warnings"]:
                             st.warning(w)
                     else:
                         st.success("Dienstplan erfolgreich generiert.")
+                    st.session_state.pop("schedule_preview", None)
                     st.rerun()
 
-        # --- Shift list (visible to all) ---
+            # Show preview if available
+            preview = st.session_state.get("schedule_preview")
+            if preview:
+                st.markdown(
+                    '<div style="background:#1E293B;border-radius:8px;padding:1rem;margin:0.5rem 0;">',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f'<div style="font-weight:600;color:#A5B4FC;margin-bottom:8px;">'
+                    f'Vorschau: {len(preview["shifts"])} Schichten</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Preview scores
+                pv1, pv2, pv3, pv4 = st.columns(4)
+                for col, label, val in [
+                    (pv1, "Abdeckung", preview["scores"]["coverage"]),
+                    (pv2, "Fairness", preview["scores"]["fairness"]),
+                    (pv3, "Präferenzen", preview["scores"]["preference"]),
+                    (pv4, "Compliance", preview["scores"]["compliance"]),
+                ]:
+                    with col:
+                        color = score_color(val)
+                        st.markdown(
+                            f'<div style="text-align:center;">'
+                            f'<span style="color:#94A3B8;font-size:0.7rem;">{label}</span><br>'
+                            f'<span style="color:{color};font-size:1.2rem;font-weight:700;">{val}%</span>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                if preview["warnings"]:
+                    for w in preview["warnings"]:
+                        st.warning(w)
+                else:
+                    st.success("Keine Warnungen — alle Gruppen sind besetzbar.")
+
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # --- Copy from previous week ---
+            prev_monday = view_monday - timedelta(weeks=1)
+            prev_schedule = session.query(Schedule).filter_by(week_start=prev_monday).first()
+            if prev_schedule:
+                prev_shift_count = session.query(Shift).filter_by(schedule_id=prev_schedule.id).count()
+                if prev_shift_count > 0:
+                    if st.button(
+                        f"Vorwoche kopieren (KW {prev_monday.isocalendar()[1]}, {prev_shift_count} Schichten)",
+                        use_container_width=True,
+                    ):
+                        # Delete existing auto shifts
+                        session.query(Shift).filter_by(
+                            schedule_id=schedule.id, is_manual=False
+                        ).delete()
+                        # Copy shifts from previous week
+                        prev_shifts = session.query(Shift).filter_by(schedule_id=prev_schedule.id).all()
+                        for ps in prev_shifts:
+                            session.add(Shift(
+                                schedule_id=schedule.id,
+                                employee_id=ps.employee_id,
+                                group_id=ps.group_id,
+                                weekday=ps.weekday,
+                                start_time=ps.start_time,
+                                end_time=ps.end_time,
+                                break_start=ps.break_start,
+                                break_minutes=ps.break_minutes,
+                                is_manual=ps.is_manual,
+                            ))
+                        # Copy scores
+                        schedule.score_coverage = prev_schedule.score_coverage
+                        schedule.score_fairness = prev_schedule.score_fairness
+                        schedule.score_preference = prev_schedule.score_preference
+                        schedule.score_compliance = prev_schedule.score_compliance
+                        session.commit()
+                        st.success(f"{prev_shift_count} Schichten aus KW {prev_monday.isocalendar()[1]} kopiert.")
+                        st.rerun()
+
+        # --- Shift list ---
         shifts = (
             session.query(Shift)
             .filter_by(schedule_id=schedule.id)
@@ -343,7 +437,6 @@ def show_schedule(user: dict, editable: bool = True):
             Employee.last_name
         ).all()
         emp_options = {e.id: e.full_name for e in employees}
-        # Available employees (not absent all week) for new shift dropdown
         available_emp_options = {
             e.id: e.full_name for e in employees
             if e.id not in all_absent_this_week
@@ -354,23 +447,26 @@ def show_schedule(user: dict, editable: bool = True):
             st.markdown('<div class="section-hdr">Schichtübersicht</div>', unsafe_allow_html=True)
             shift_rows = []
             for s in shifts:
-                emp = emp_options.get(s.employee_id, "?")
-                grp = grp_options.get(s.group_id, "—") if s.group_id else "—"
+                emp_name = emp_options.get(s.employee_id, "?")
+                grp_name = grp_options.get(s.group_id, "—") if s.group_id else "—"
+                hours = shift_duration_hours(s.start_time, s.end_time, s.break_minutes)
                 shift_rows.append({
                     "Tag": WEEKDAYS_DE[s.weekday],
-                    "Mitarbeiter": emp,
-                    "Gruppe": grp,
+                    "Mitarbeiter": emp_name,
+                    "Gruppe": grp_name,
                     "Von": s.start_time,
                     "Bis": s.end_time,
                     "Pause": f"{s.break_minutes} min" if s.break_minutes else "—",
+                    "Stunden": f"{hours:.1f}h",
+                    "Typ": "Manuell" if s.is_manual else "Auto",
                 })
             st.dataframe(shift_rows, use_container_width=True, hide_index=True)
 
-        # --- Admin-only: Shift editing ---
+        # --- Admin editing ---
         if not editable:
             st.caption("Nur Administratoren können Schichten bearbeiten.")
         else:
-            # --- Edit existing shift ---
+            # --- Edit shift ---
             if shifts:
                 st.markdown('<div class="section-hdr">Schicht bearbeiten</div>',
                             unsafe_allow_html=True)
@@ -402,8 +498,8 @@ def show_schedule(user: dict, editable: bool = True):
                                 format_func=lambda k: emp_options[k],
                             )
                         with c2:
-                            edit_start = st.text_input("Beginn", value=shift.start_time)
-                            edit_end = st.text_input("Ende", value=shift.end_time)
+                            edit_start = st.text_input("Beginn (HH:MM)", value=shift.start_time)
+                            edit_end = st.text_input("Ende (HH:MM)", value=shift.end_time)
                         with c3:
                             edit_grp = st.selectbox(
                                 "Gruppe",
@@ -424,16 +520,21 @@ def show_schedule(user: dict, editable: bool = True):
                             delete = st.form_submit_button("Schicht löschen", use_container_width=True)
 
                         if save:
-                            shift.weekday = edit_day
-                            shift.employee_id = edit_emp
-                            shift.group_id = edit_grp
-                            shift.start_time = edit_start.strip()
-                            shift.end_time = edit_end.strip()
-                            shift.break_minutes = edit_break
-                            shift.is_manual = True
-                            session.commit()
-                            st.success("Schicht aktualisiert.")
-                            st.rerun()
+                            if not _valid_time(edit_start) or not _valid_time(edit_end):
+                                st.error("Ungültiges Zeitformat. Bitte HH:MM verwenden (z.B. 08:00).")
+                            elif _time_to_min(edit_start.strip()) >= _time_to_min(edit_end.strip()):
+                                st.error("Beginn muss vor Ende liegen.")
+                            else:
+                                shift.weekday = edit_day
+                                shift.employee_id = edit_emp
+                                shift.group_id = edit_grp
+                                shift.start_time = edit_start.strip()
+                                shift.end_time = edit_end.strip()
+                                shift.break_minutes = edit_break
+                                shift.is_manual = True
+                                session.commit()
+                                st.success("Schicht aktualisiert.")
+                                st.rerun()
                         elif delete:
                             session.delete(shift)
                             session.commit()
@@ -458,8 +559,8 @@ def show_schedule(user: dict, editable: bool = True):
                         key="new_shift_emp",
                     )
                 with c2:
-                    new_start = st.text_input("Beginn", value="08:00", key="new_shift_start")
-                    new_end = st.text_input("Ende", value="16:00", key="new_shift_end")
+                    new_start = st.text_input("Beginn (HH:MM)", value="08:00", key="new_shift_start")
+                    new_end = st.text_input("Ende (HH:MM)", value="16:00", key="new_shift_end")
                 with c3:
                     new_grp = st.selectbox(
                         "Gruppe",
@@ -474,7 +575,11 @@ def show_schedule(user: dict, editable: bool = True):
 
                 if st.form_submit_button("Schicht anlegen", use_container_width=True):
                     if not available_emp_options:
-                        st.error("Keine verfügbaren Mitarbeiter (alle abwesend oder inaktiv).")
+                        st.error("Keine verfügbaren Mitarbeiter.")
+                    elif not _valid_time(new_start) or not _valid_time(new_end):
+                        st.error("Ungültiges Zeitformat. Bitte HH:MM verwenden (z.B. 08:00).")
+                    elif _time_to_min(new_start.strip()) >= _time_to_min(new_end.strip()):
+                        st.error("Beginn muss vor Ende liegen.")
                     else:
                         s_min = _time_to_min(new_start.strip())
                         e_min = _time_to_min(new_end.strip())
@@ -483,7 +588,7 @@ def show_schedule(user: dict, editable: bool = True):
                         mid_m = (mid_m // 30) * 30
                         break_start = f"{mid_h:02d}:{mid_m:02d}" if new_break > 0 else None
 
-                        new_shift = Shift(
+                        session.add(Shift(
                             schedule_id=schedule.id,
                             employee_id=new_emp,
                             group_id=new_grp,
@@ -493,20 +598,18 @@ def show_schedule(user: dict, editable: bool = True):
                             break_start=break_start,
                             break_minutes=new_break,
                             is_manual=True,
-                        )
-                        session.add(new_shift)
+                        ))
                         session.commit()
                         st.success("Schicht angelegt.")
                         st.rerun()
 
-            # --- Schedule status actions ---
+            # --- Status actions ---
             st.markdown('<div class="section-hdr">Status</div>', unsafe_allow_html=True)
 
             sc1, sc2, sc3 = st.columns(3)
             with sc1:
                 if schedule.status != "published":
                     if st.button("Veröffentlichen", use_container_width=True):
-                        from datetime import datetime, timezone
                         schedule.status = "published"
                         schedule.published_at = datetime.now(timezone.utc)
                         session.commit()

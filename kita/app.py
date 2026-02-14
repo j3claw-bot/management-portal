@@ -441,15 +441,14 @@ def show_portal():
         if is_admin:
             page = st.radio(
                 "Navigation",
-                ["Dienstplan", "Mitarbeiter", "Gruppen"],
+                ["Dashboard", "Dienstplan", "Mitarbeiter", "Gruppen", "Druckansicht"],
                 horizontal=True,
                 label_visibility="collapsed",
             )
         else:
-            page = "Dienstplan"
-            st.radio(
+            page = st.radio(
                 "Navigation",
-                ["Dienstplan"],
+                ["Dashboard", "Dienstplan"],
                 horizontal=True,
                 label_visibility="collapsed",
             )
@@ -459,7 +458,10 @@ def show_portal():
             st.rerun()
 
     # Route to page
-    if page == "Dienstplan":
+    if page == "Dashboard":
+        from pages.dashboard import show_dashboard
+        show_dashboard(user)
+    elif page == "Dienstplan":
         from pages.schedule import show_schedule
         show_schedule(user, editable=is_admin)
     elif page == "Mitarbeiter" and is_admin:
@@ -468,6 +470,9 @@ def show_portal():
     elif page == "Gruppen" and is_admin:
         from pages.groups import show_groups
         show_groups(user)
+    elif page == "Druckansicht":
+        from pages.print_view import show_print_view
+        show_print_view(user)
 
 
 # ---------------------------------------------------------------------------
