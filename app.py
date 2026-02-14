@@ -153,12 +153,25 @@ def show_portal():
                 label_visibility="collapsed",
             )
         else:
-            page = "Dashboard"
+            page = st.radio(
+                "Navigation",
+                ["Dashboard"],
+                horizontal=True,
+                label_visibility="collapsed",
+            )
     with col_out:
         if st.button("Sign Out"):
             audit(user["username"], "logout")
             st.session_state.clear()
             st.rerun()
+
+    # Kita link
+    st.markdown(
+        '<div style="margin:-0.5rem 0 1rem;"><a href="/kita" target="_self" '
+        'style="color:#A5B4FC;text-decoration:none;font-size:0.9rem;">'
+        '&#127968; Kita Dienstplan &rarr;</a></div>',
+        unsafe_allow_html=True,
+    )
 
     if page == "Dashboard":
         show_dashboard(user)
@@ -245,30 +258,31 @@ def show_dashboard(user: dict):
                     unsafe_allow_html=True,
                 )
 
-        st.markdown(
-            '<div class="section-hdr">Recent Activity</div>', unsafe_allow_html=True
-        )
-        recent_events = (
-            session.query(LoginEvent)
-            .order_by(LoginEvent.logged_in_at.desc())
-            .limit(10)
-            .all()
-        )
-        if recent_events:
-            rows = []
-            for ev in recent_events:
-                ev_user = session.query(User).get(ev.user_id)
-                rows.append(
-                    {
-                        "User": ev_user.username if ev_user else "?",
-                        "Name": ev_user.name if ev_user else "?",
-                        "Time": _ts(ev.logged_in_at),
-                        "IP": ev.ip_address or "—",
-                    }
-                )
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-        else:
-            st.info("No login events yet.")
+        if user["role"] == "admin":
+            st.markdown(
+                '<div class="section-hdr">Recent Activity</div>', unsafe_allow_html=True
+            )
+            recent_events = (
+                session.query(LoginEvent)
+                .order_by(LoginEvent.logged_in_at.desc())
+                .limit(10)
+                .all()
+            )
+            if recent_events:
+                rows = []
+                for ev in recent_events:
+                    ev_user = session.query(User).get(ev.user_id)
+                    rows.append(
+                        {
+                            "User": ev_user.username if ev_user else "?",
+                            "Name": ev_user.name if ev_user else "?",
+                            "Time": _ts(ev.logged_in_at),
+                            "IP": ev.ip_address or "—",
+                        }
+                    )
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("No login events yet.")
 
         # ── Your profile ──
         if db_user:

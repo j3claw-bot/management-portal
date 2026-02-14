@@ -15,5 +15,21 @@ services:
       - SMTP_PASS=${SMTP_PASS:-}
       - SMTP_FROM=${SMTP_FROM:-noreply@jan-miller.de}
 
+  kita:
+    build: ./kita
+    container_name: kita-scheduler
+    restart: unless-stopped
+    ports:
+      - "8502:8502"
+    volumes:
+      - kita_data:/app/data
+      - portal_data:/app/portal_data:ro
+    environment:
+      - KITA_DB_PATH=/app/data/kita.db
+      - PORTAL_DB_PATH=/app/portal_data/portal.db
+    depends_on:
+      - portal
+
 volumes:
   portal_data:
+  kita_data:
