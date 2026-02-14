@@ -10,8 +10,7 @@ import streamlit as st
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-from models import get_session as get_kita_session, KitaSettings, Employee, Group
-from seed import seed
+from models import get_session as get_kita_session, KitaSettings, Employee, Group, EmployeeRestriction
 
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "j3claw-default-session-key-change-me").encode()
 
@@ -185,10 +184,12 @@ st.markdown("""
     .coverage-warn { background: #EAB308; }
     .coverage-bad { background: #EF4444; }
 
-    /* Hide Streamlit default elements */
+    /* Hide Streamlit default elements and sidebar */
     #MainMenu { visibility: hidden; }
     footer { visibility: hidden; }
     header[data-testid="stHeader"] { display: none; }
+    section[data-testid="stSidebar"] { display: none; }
+    button[kind="header"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -338,14 +339,21 @@ def show_setup_wizard(user: dict):
 
             employees = session.query(Employee).all()
             if employees:
-                st.dataframe([{
-                    "Name": f"{e.first_name} {e.last_name}",
-                    "Rolle": "Erstkraft" if e.role == "erstkraft" else "Zweitkraft",
-                    "Bereich": {"krippe": "Krippe", "elementar": "Elementar", "both": "Beide"}.get(e.area, e.area),
-                    "Stunden/Wo": e.contract_hours,
-                } for e in employees], use_container_width=True, hide_index=True)
+                emp_list = []
+                for e in employees:
+                    prefs = session.query(EmployeeRestriction).filter_by(employee_id=e.id).all()
+                    pref_str = ", ".join([r.restriction_type.replace("_", " ").title() for r in prefs]) if prefs else "—"
+                    emp_list.append({
+                        "Name": f"{e.first_name} {e.last_name}",
+                        "Rolle": "Erstkraft" if e.role == "erstkraft" else "Zweitkraft",
+                        "Bereich": {"krippe": "Krippe", "elementar": "Elementar", "both": "Beide"}.get(e.area, e.area),
+                        "Stunden/Wo": e.contract_hours,
+                        "Präferenzen": pref_str,
+                    })
+                st.dataframe(emp_list, use_container_width=True, hide_index=True)
 
             with st.form("setup_employee", clear_on_submit=True):
+                st.markdown("**Mitarbeiterdaten**")
                 c1, c2 = st.columns(2)
                 with c1:
                     e_first = st.text_input("Vorname")
@@ -359,6 +367,20 @@ def show_setup_wizard(user: dict):
                                           format_func=lambda k: {"krippe": "Krippe", "elementar": "Elementar", "both": "Beide"}[k])
                     e_days = st.number_input("Tage/Woche", min_value=1, max_value=5, value=5)
 
+                st.markdown("**Präferenzen & Einschränkungen** (optional)")
+                p1, p2 = st.columns(2)
+                with p1:
+                    no_early = st.checkbox("Kein Frühdienst")
+                    prefers_early = st.checkbox("Bevorzugt Frühdienst")
+                    fixed_day_off = st.selectbox("Fester freier Tag",
+                                                  ["Keiner", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"])
+                with p2:
+                    no_late = st.checkbox("Kein Spätdienst")
+                    prefers_late = st.checkbox("Bevorzugt Spätdienst")
+                    max_consecutive = st.number_input("Max. aufeinanderfolgende Tage",
+                                                      min_value=0, max_value=5, value=0,
+                                                      help="0 = keine Einschränkung")
+
                 fc1, fc2 = st.columns(2)
                 with fc1:
                     add_emp = st.form_submit_button("Mitarbeiter hinzufügen", use_container_width=True)
@@ -366,10 +388,39 @@ def show_setup_wizard(user: dict):
                     finish = st.form_submit_button("Einrichtung abschließen", use_container_width=True)
 
                 if add_emp and e_first and e_last:
-                    session.add(Employee(
+                    emp = Employee(
                         first_name=e_first.strip(), last_name=e_last.strip(),
                         role=e_role, area=e_area, contract_hours=e_hours, days_per_week=e_days,
-                    ))
+                    )
+                    session.add(emp)
+                    session.flush()  # Get employee ID
+
+                    # Add restrictions/preferences
+                    if no_early:
+                        session.add(EmployeeRestriction(
+                            employee_id=emp.id, restriction_type="no_early_shift", value="true"
+                        ))
+                    if no_late:
+                        session.add(EmployeeRestriction(
+                            employee_id=emp.id, restriction_type="no_late_shift", value="true"
+                        ))
+                    if prefers_early:
+                        session.add(EmployeeRestriction(
+                            employee_id=emp.id, restriction_type="prefers_early", value="true"
+                        ))
+                    if prefers_late:
+                        session.add(EmployeeRestriction(
+                            employee_id=emp.id, restriction_type="prefers_late", value="true"
+                        ))
+                    if fixed_day_off != "Keiner":
+                        session.add(EmployeeRestriction(
+                            employee_id=emp.id, restriction_type="fixed_day_off", value=fixed_day_off
+                        ))
+                    if max_consecutive > 0:
+                        session.add(EmployeeRestriction(
+                            employee_id=emp.id, restriction_type="max_consecutive_days", value=str(max_consecutive)
+                        ))
+
                     session.commit()
                     st.success(f"{e_first} {e_last} angelegt.")
                     st.rerun()
