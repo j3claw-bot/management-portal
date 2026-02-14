@@ -1,0 +1,14 @@
+services:
+  portal:
+    build: .
+    container_name: management-portal
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - portal_data:/app/data
+    environment:
+      - USERS_FILE=/app/data/users.json
+
+volumes:
+  portal_data:
