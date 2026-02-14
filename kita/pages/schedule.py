@@ -12,6 +12,8 @@ from models import (
     Shift,
     get_session,
 )
+from engine.scheduler import generate_schedule, apply_schedule
+from engine.scoring import score_color, score_label
 
 WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]
 
@@ -285,6 +287,49 @@ def show_schedule(user: dict, editable: bool = True):
                 '</div>',
                 unsafe_allow_html=True,
             )
+
+        # --- Scores (if available) ---
+        if schedule.score_coverage > 0 or schedule.score_fairness > 0:
+            sc1, sc2, sc3 = st.columns(3)
+            for col, label, val in [
+                (sc1, "Abdeckung", schedule.score_coverage),
+                (sc2, "Fairness", schedule.score_fairness),
+                (sc3, "Präferenzen", schedule.score_preference),
+            ]:
+                with col:
+                    color = score_color(val)
+                    st.markdown(
+                        f'<div style="background:#1E293B;border-radius:8px;padding:8px 12px;text-align:center;">'
+                        f'<div style="color:#94A3B8;font-size:0.75rem;text-transform:uppercase;">{label}</div>'
+                        f'<div style="color:{color};font-size:1.4rem;font-weight:700;">{val}%</div>'
+                        f'<div style="color:#64748B;font-size:0.7rem;">{score_label(val)}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        # --- Auto-generate (admin only) ---
+        if editable and schedule.status == "draft":
+            st.markdown('<div class="section-hdr">Automatische Planung</div>',
+                        unsafe_allow_html=True)
+            ag_c1, ag_c2 = st.columns([3, 1])
+            with ag_c1:
+                st.caption(
+                    "Erstellt einen Dienstplan basierend auf verfügbaren Mitarbeitern, "
+                    "Betreuungsschlüsseln, Abwesenheiten und Präferenzen. "
+                    "Manuell erstellte Schichten bleiben erhalten."
+                )
+            with ag_c2:
+                if st.button("Dienstplan generieren", use_container_width=True, type="primary"):
+                    with st.spinner("Plane Schichten..."):
+                        result = generate_schedule(session, view_monday)
+                        apply_schedule(session, schedule, result)
+
+                    if result["warnings"]:
+                        for w in result["warnings"]:
+                            st.warning(w)
+                    else:
+                        st.success("Dienstplan erfolgreich generiert.")
+                    st.rerun()
 
         # --- Shift list (visible to all) ---
         shifts = (

@@ -1,5 +1,11 @@
+import base64
+import hashlib
+import hmac
+import json
 import logging
+import os
 import sys
+import time
 from datetime import datetime, timezone
 
 import streamlit as st
@@ -7,6 +13,19 @@ import streamlit as st
 from auth import authenticate, generate_password, hash_password, init_admin
 from database import AuditLog, LocalMail, LoginEvent, User, audit, get_session, get_setting, set_setting
 from email_service import send_test_email, send_welcome_email
+
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "j3claw-default-session-key-change-me").encode()
+
+
+def _make_sso_token(user: dict) -> str:
+    """Generate a short-lived HMAC-signed token for SSO handoff."""
+    payload = json.dumps({
+        "id": user["id"], "u": user["username"], "n": user["name"],
+        "e": user["email"], "r": user["role"], "exp": int(time.time()) + 60,
+    }, separators=(",", ":"))
+    payload_b64 = base64.urlsafe_b64encode(payload.encode()).decode()
+    sig = hmac.new(SESSION_SECRET, payload_b64.encode(), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{sig}"
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
@@ -165,11 +184,12 @@ def show_portal():
             st.session_state.clear()
             st.rerun()
 
-    # Kita link
+    # Kita link with SSO token
+    sso_token = _make_sso_token(user)
     st.markdown(
-        '<div style="margin:-0.5rem 0 1rem;"><a href="/kita" target="_self" '
-        'style="color:#A5B4FC;text-decoration:none;font-size:0.9rem;">'
-        '&#127968; Kita Dienstplan &rarr;</a></div>',
+        f'<div style="margin:-0.5rem 0 1rem;"><a href="/kita/?sso={sso_token}" target="_self" '
+        f'style="color:#A5B4FC;text-decoration:none;font-size:0.9rem;">'
+        f'&#127968; Kita Dienstplan &rarr;</a></div>',
         unsafe_allow_html=True,
     )
 

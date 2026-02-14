@@ -9,6 +9,7 @@ services:
       - portal_data:/app/data
     environment:
       - DB_PATH=/app/data/portal.db
+      - SESSION_SECRET=${SESSION_SECRET:-j3claw-kita-sso-8f3a2b1c9d7e}
       - SMTP_HOST=${SMTP_HOST:-}
       - SMTP_PORT=${SMTP_PORT:-587}
       - SMTP_USER=${SMTP_USER:-}
@@ -27,6 +28,7 @@ services:
     environment:
       - KITA_DB_PATH=/app/data/kita.db
       - PORTAL_DB_PATH=/app/portal_data/portal.db
+      - SESSION_SECRET=${SESSION_SECRET:-j3claw-kita-sso-8f3a2b1c9d7e}
     depends_on:
       - portal
 

@@ -14,6 +14,9 @@ RESTRICTION_TYPES = {
     "max_consecutive_days": "Max. aufeinanderfolgende Tage",
     "only_area": "Nur bestimmter Bereich",
     "fixed_schedule": "Fester Dienstplan",
+    "prefers_early": "Bevorzugt Frühdienst",
+    "prefers_late": "Bevorzugt Spätdienst",
+    "prefers_colleague": "Bevorzugt Zusammenarbeit mit",
 }
 
 ABSENCE_TYPES = {
@@ -293,6 +296,21 @@ def show_employees(user: dict):
                         elif r_type == "only_area":
                             r_value = st.selectbox("Wert", ["krippe", "elementar"],
                                                    format_func=lambda k: AREAS.get(k, k))
+                        elif r_type == "prefers_colleague":
+                            other_emps = [e for e in employees if e.id != emp.id]
+                            if other_emps:
+                                r_value = st.selectbox(
+                                    "Kolleg/in",
+                                    [e.id for e in other_emps],
+                                    format_func=lambda eid: next(
+                                        (e.full_name for e in other_emps if e.id == eid), "?"),
+                                )
+                                r_value = str(r_value)
+                            else:
+                                r_value = st.text_input("Mitarbeiter-ID")
+                        elif r_type in ("prefers_early", "prefers_late"):
+                            r_value = "true"
+                            st.caption("Wird beim Auto-Dienstplan berücksichtigt.")
                         else:
                             r_value = st.text_input("Wert", value="true")
 
