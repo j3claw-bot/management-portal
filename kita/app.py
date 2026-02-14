@@ -95,16 +95,8 @@ st.markdown("""
         padding: 0.6rem 1rem;
         background: #1E293B;
         border-radius: 8px;
-        margin-bottom: 1rem;
+        margin-bottom: 0.5rem;
     }
-    .topbar .nav-links a {
-        color: #94A3B8;
-        text-decoration: none;
-        margin-right: 1.2rem;
-        font-size: 0.95rem;
-    }
-    .topbar .nav-links a:hover,
-    .topbar .nav-links a.active { color: #E2E8F0; }
     .topbar .user-info { color: #94A3B8; font-size: 0.9rem; }
 
     /* Stat cards */
@@ -210,17 +202,6 @@ _init_db()
 # Navigation & routing
 # ---------------------------------------------------------------------------
 
-NAV_ADMIN = {
-    "Dienstplan": "schedule",
-    "Mitarbeiter": "employees",
-    "Gruppen": "groups",
-}
-
-NAV_USER = {
-    "Dienstplan": "schedule",
-}
-
-
 def show_login():
     st.markdown('<div class="login-wrap">', unsafe_allow_html=True)
     st.markdown("""
@@ -250,53 +231,53 @@ def show_login():
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def show_topbar(user: dict, active_page: str):
-    nav = NAV_ADMIN if user["role"] == "admin" else NAV_USER
-    links_html = ""
-    for label, key in nav.items():
-        cls = "active" if key == active_page else ""
-        links_html += f'<a href="?page={key}" class="{cls}" target="_self">{label}</a>'
-
-    role_badge = "Admin" if user["role"] == "admin" else "Benutzer"
-    st.markdown(f"""
-    <div class="topbar">
-        <div class="nav-links">{links_html}</div>
-        <div class="user-info">{user['name']} <small>({role_badge})</small></div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
 def show_portal():
     user = st.session_state["user"]
+    is_admin = user["role"] == "admin"
 
-    # Determine current page from query params
-    page = st.query_params.get("page", "schedule")
+    # Top bar with branding + user info + sign out
+    role_badge = "Admin" if is_admin else "Benutzer"
+    st.markdown(
+        f'<div class="topbar">'
+        f'<span style="color:#A5B4FC;font-weight:700;">Kita Dienstplan</span>'
+        f'<span class="user-info">{user["name"]} <small>({role_badge})</small></span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
-    # Topbar with nav + sign-out
-    col_nav, col_out = st.columns([9, 1])
-    with col_nav:
-        show_topbar(user, page)
-    with col_out:
+    # Navigation via st.radio (preserves session state)
+    nav_col, _, out_col = st.columns([6, 2, 1])
+    with nav_col:
+        if is_admin:
+            page = st.radio(
+                "Navigation",
+                ["Dienstplan", "Mitarbeiter", "Gruppen"],
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+        else:
+            page = "Dienstplan"
+            st.radio(
+                "Navigation",
+                ["Dienstplan"],
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+    with out_col:
         if st.button("Abmelden", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
-    is_admin = user["role"] == "admin"
-
     # Route to page
-    if page == "schedule":
+    if page == "Dienstplan":
         from pages.schedule import show_schedule
         show_schedule(user, editable=is_admin)
-    elif page == "employees" and is_admin:
+    elif page == "Mitarbeiter" and is_admin:
         from pages.employees import show_employees
         show_employees(user)
-    elif page == "groups" and is_admin:
+    elif page == "Gruppen" and is_admin:
         from pages.groups import show_groups
         show_groups(user)
-    elif page in ("employees", "groups"):
-        st.warning("Zugriff verweigert. Nur Administratoren können diese Seite sehen.")
-    else:
-        st.warning("Seite nicht gefunden.")
 
 
 # ---------------------------------------------------------------------------
